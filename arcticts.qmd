@@ -1,0 +1,914 @@
+---
+title: Arctic time series
+author: Vyacheslav Lyubchich, et al.
+date: today
+date-format: iso
+format:
+  html:
+    number-sections: true
+    toc: true
+    toc-float: true
+    toc-depth: 3
+    code-fold: true
+    fig-width: 8
+    fig-height: 5
+bibliography:
+    - refpackages.bib
+knitr:
+    opts_chunk:
+        
+        echo: true
+        message: false
+        warning: false
+        comment: "#>"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+rm(list = ls())
+
+# Data handling
+library(dplyr)
+library(tidyr)
+library(readxl)
+
+# Plotting
+library(ggplot2)
+theme_set(theme_light())
+library(patchwork)
+library(plotly)
+library(leaflet)
+library(RColorBrewer)
+library(htmltools)
+library(mapview)
+library(car)
+library(sf)
+library(marmap)
+library(rnaturalearth)
+
+# Modeling
+library(imputeTS)
+library(fpc)
+library(cluster)
+library(zoo)
+library(dtw)
+library(dbscan)
+library(nlme)
+library(simr)
+library(pwr)
+
+source("code/fun_clucomp.R")
+source("code/fun_kneedle.R")
+```
+
+```{r}
+# Significance level
+alpha <- 0.05
+
+# Minimal number of observations required per station
+n_thr <- 5
+```
+
+
+# Data
+
+Import benthic data.
+```{r}
+D0 <- read_xlsx("dataraw/BenthicTimeSeries_UniqueID_0-5nm_DBO_063023_v3.xlsx", 
+                sheet = 3) %>%
+  dplyr::select(-DataYear) %>% 
+  dplyr::rename(Date = DataDate) %>% 
+  dplyr::mutate(Date = as.Date(Date, '%Y%m%d'),
+                Year = as.integer(format(Date, "%Y")),
+                Month = as.integer(format(Date, '%m')),
+                StationName_Standard = gsub(' ', '', StationName_Standard),
+                DBOnme = gsub(' ', '', DBOnme)
+  )
+
+# Check for 1-to-1 relationship between StationName_Standard and DBOnme
+tmp <- with(D0, 
+            table(StationName_Standard, DBOnme)
+)
+tmp <- all(rowSums(tmp > 0) == 1) & all(colSums(tmp > 0) == 1)
+if (!tmp) print("Check station labels!")
+```
+
+Define summer as the months June--August.
+```{r}
+summer <- 6:8
+```
+
+```{r}
+#| label: fig-nyear
+#| fig-cap: "Number of samples per year."
+
+# Count the number of samples per year 
+N_year <- D0 %>% 
+  dplyr::group_by(Year) %>% 
+  dplyr::summarise(Total = n()) 
+
+# Count the number of summer samples per year 
+N_summer <- D0 %>% 
+  dplyr::filter(Month %in% summer) %>% 
+  dplyr::group_by(Year) %>% 
+  dplyr::summarise(Summer = n())
+
+# Combine data
+N <- N_year %>%
+  dplyr::left_join(N_summer, by = "Year") %>%
+  dplyr::mutate(Other = Total - Summer) %>%
+  pivot_longer(cols = c("Summer", "Other"),
+               names_to = "Season", values_to = "Samples")
+
+# Stacked bar plot
+p <- ggplot(N, aes(x = Year, y = Samples, fill = Season)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("Summer" = "tomato", "Other" = "gray")) +
+  labs(x = "Year",
+       y = "Number of samples",
+       fill = "Season") + 
+  theme(panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank())
+
+ggplotly(p)
+```
+
+Keep only data for summers 2010--2019, remove data from DBO4 and DBO5.
+```{r}
+D <- D0 %>%
+  dplyr::filter(Month %in% summer) %>% 
+  dplyr::filter(Year %in% 2010:2019) %>% 
+  dplyr::filter(!grepl('DBO4', DBOnme) & !grepl('DBO5', DBOnme))
+```
+
+Aggregate the data by calculating summer averages for selected environmental variables.
+```{r}
+d <- D %>%
+  group_by(DBOnme, Year) %>%
+  summarise(Temp = mean(Temp, na.rm = TRUE),
+            Salinity = mean(Salinity, na.rm = TRUE),
+            SedChla = mean(sedchla, na.rm = TRUE),
+            BiomGC = mean(BiomGC, na.rm = TRUE),
+            PhiGTE5 = mean(phigte5, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  mutate_all(~ replace(., is.nan(.), NA))
+vars2study <- names(d)[-c(1:2)]
+```
+
+```{r}
+#| label: fig-nstation
+#| fig-cap: "Histogram of the number of aggregate samples per station."
+
+# Count number of observations per station
+N_station <- d %>%
+  dplyr::group_by(DBOnme) %>% 
+  dplyr::summarise(n = n())
+
+# Histogram
+p <- ggplot(N_station, aes(x = n)) +
+  geom_histogram(binwidth = 1, fill = "tomato", color = NA) +
+  labs(x = "Number of aggregated samples",
+       y = "Number of stations") + 
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 4), 
+                     labels = scales::number_format(accuracy = 1)) + 
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 4), 
+                     labels = scales::number_format(accuracy = 1)) + 
+  theme(panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank())
+
+ggplotly(p)
+```
+
+Keep stations with at least `r n_thr` observations.
+```{r}
+# Select which stations to keep
+stations2keep <- N_station %>% 
+  dplyr::filter(n >= n_thr) %>% 
+  dplyr::pull(DBOnme)
+
+# Filter the aggregated data accordingly
+d <- d %>% 
+  dplyr::filter(DBOnme %in% stations2keep)
+```
+
+Reformat the data in a "wide" format (time series as columns).
+```{r}
+# Reformat the data to wide format by Year for each DBOnme
+d_wide <- lapply(vars2study, function(x)
+  d %>% 
+    dplyr::select(all_of(c("DBOnme", "Year", x))) %>% 
+    pivot_wider(names_from = DBOnme, values_from = x)
+)
+names(d_wide) <- vars2study
+```
+
+```{r}
+#| label: fig-heat
+#| fig-cap: "Heatmaps showing the availability and values of aggregate samples per year and station."
+#| fig-height: 15
+
+d_long <- d %>% 
+  pivot_longer(cols = c(-DBOnme, -Year), 
+               names_to = "Variable", 
+               values_to = "Value") %>% 
+  na.omit()
+
+# Create individual plots
+p <- lapply(vars2study, function(v) {
+  ggplot(d_long %>% dplyr::filter(Variable == v), 
+         aes(x = Year, y = DBOnme, fill = Value)) +
+    geom_tile() +
+    scale_fill_gradient(low = "skyblue", high = "red") +
+    labs(title = v, x = "", y = "", fill = "Value") +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 4), 
+                       labels = scales::number_format(accuracy = 1)) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+})
+
+# Combine the plots using patchwork
+combined_plot <- wrap_plots(p) +
+  plot_layout(ncol = 2)
+
+# Display the combined plot
+print(combined_plot)
+```
+
+Impute missing values using state-space models for univariate time series based on a decomposition of the series -- see the function `StructTS()` [@R-base].
+```{r}
+# Impute pattern one (missing only time point #2, i.e. 2011)
+d_wide_impute <- lapply(d_wide, function(X)
+  cbind(X[,1],
+        apply(X[, apply(X, 2, function(y) all(is.na(y[2])) & all(!is.na(y[c(1, 3:10)])))], 2, function(x) 
+          na_kalman(x, model = "StructTS", smooth = TRUE, type = "trend")), 
+        X[, -1][, apply(X[, -1], 2, function(y) !all(is.na(y[2])) | any(is.na(y[c(1, 3:10)])))]) %>% 
+    as_tibble %>%
+    select(1, sort(names(X)[-1]))
+) %>%
+  # Impute pattern two (missing times points #1 and #3-4, i.e. 2010, 2012, 2013; impute only at time points #3-4)
+  lapply(function(X)
+    cbind(X[,1],
+          rbind(rep(NA, sum(apply(X, 2, function(y) all(is.na(y[c(1, 3:4)])) & all(!is.na(y[c(2, 5:10)]))))),
+                apply(X[2:10, apply(X, 2, function(y) all(is.na(y[c(1, 3:4)])) & all(!is.na(y[c(2, 5:10)])))], 2, function(x) 
+                  na_kalman(x, model = "StructTS", smooth = TRUE, type = "trend"))), 
+          X[, -1][, apply(X[, -1], 2, function(y) any(!is.na(y[c(1, 3:4)])) | any(is.na(y[c(2, 5:10)])))]) %>% 
+      as_tibble %>%
+      select(1, sort(names(X)[-1])))
+```
+
+Plot the heatmaps again to assess the imputations (@fig-heatimpute).
+```{r}
+#| label: fig-heatimpute
+#| fig-cap: "Heatmaps showing the values of aggregate samples (including imputed values) per year and station."
+#| fig-height: 15
+
+# Create individual plots
+p <- lapply(vars2study, function(v) {
+  ggplot(d_wide_impute[[v]] %>% 
+           pivot_longer(cols = -Year, names_to = "Station", values_to = "Value"), 
+         aes(x = Year, y = Station, fill = Value)) +
+    geom_tile() +
+    scale_fill_gradient(low = "skyblue", high = "red") +
+    labs(title = v, x = "", y = "", fill = "Value") +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 4), 
+                       labels = scales::number_format(accuracy = 1)) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+})
+
+# Combine the plots using patchwork
+combined_plot <- wrap_plots(p) +
+  plot_layout(ncol = 2)
+
+# Display the combined plot
+print(combined_plot)
+```
+
+Extract coordinates of the selected stations.
+```{r}
+COORD <- D %>% 
+  dplyr::filter(DBOnme %in% stations2keep) %>% 
+  dplyr::group_by(DBOnme) %>% 
+  dplyr::summarise(Latitude = mean(Latitude, na.rm = TRUE),
+                   Longitude = mean(Longitude, na.rm = TRUE))
+```
+
+```{r}
+#| label: fig-map0
+#| fig-cap: "Map of the selected stations."
+
+# Define the geographic area (Gulf of Alaska)
+min_lon <- -178
+max_lon <- -160
+min_lat <- 61.0
+max_lat <- 69.0
+
+# Download bathymetry data from NOAA
+# Resolution = 1 (1-minute resolution)
+bathy_data <- getNOAA.bathy(lon1 = min_lon, lon2 = max_lon,
+                            lat1 = min_lat, lat2 = max_lat,
+                            resolution = 1)
+
+# Convert bathymetry data to a data frame for ggplot
+bathy_df <- as.xyz(bathy_data)
+
+# Create data frames for geographic labels
+geo_labels <- data.frame(
+  label = c("Bering Sea", "Alaska (U.S.A.)", "Russia", "Chukchi Sea"),
+  lon = c(-169, -163, -176, -173),
+  lat = c(62, 65.5, 66, 68.5)
+)
+geo_labels_dbo <- data.frame(
+  label = c("DBO1", "DBO2", "DBO3"),
+  lon = c(-176, -168, -167),
+  lat = c(63, 64.25, 67.5)
+)
+
+# Get coastline data for plotting land
+land_data <- ne_countries(scale = "large", returnclass = "sf")
+
+# Create the map
+map_plot <- ggplot() +
+  # 1. Add the bathymetry layer as a raster
+  geom_raster(data = bathy_df, aes(x = V1, y = V2, fill = V3)) +
+  
+  # 2. Add a color scale for bathymetry (blue gradient for water)
+  scale_fill_gradientn(
+    colors = c("darkblue", "blue", "lightblue"),
+    values = scales::rescale(c(min(bathy_df$V3, na.rm = TRUE), -100, 0)),
+    name = "Depth (m)",
+    limits = c(min(bathy_df$V3, na.rm = TRUE), 0) # Focus on negative depths (water)
+  ) +
+  
+  # 3. Add contour lines for bathymetry
+  geom_contour(data = bathy_df, aes(x = V1, y = V2, z = V3),
+               breaks = seq(-5000, 0, by = 1000), # Depths in meters, suitable for Gulf of Alaska
+               colour = "white", alpha = 0.5, linewidth = 0.5) +
+  
+  # 4. Add land/coastline features
+  geom_sf(data = land_data, fill = "antiquewhite", color = "black", inherit.aes = FALSE) +
+  
+  # 5. Add station locations as points
+  geom_point(data = COORD, aes(x = Longitude, y = Latitude),
+             shape = 24, # Triangle shape
+             fill = "red",
+             color = "black",
+             size = 4) +
+  
+  # 6. Add geographic labels
+  geom_label(data = geo_labels, aes(x = lon, y = lat, label = label),
+             size = 3, fill = "white", alpha = 0.7, label.padding = unit(0.15, "lines"),
+             color = "black", fontface = "bold") +
+  geom_label(data = geo_labels_dbo, aes(x = lon, y = lat, label = label),
+             size = 4, fill = "white", alpha = 0.7, label.padding = unit(0.15, "lines"),
+             color = "red", fontface = "bold") +
+  
+  # 7. Set map limits and labels
+  coord_sf(xlim = c(min_lon, max_lon), ylim = c(min_lat, max_lat), expand = FALSE) +
+  labs(#title = "Bathymetry of Gulf of Alaska",
+       #subtitle = "With Station Locations and Geographic Features",
+       x = "Longitude",
+       y = "Latitude",
+       fill = "Depth (m)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right",
+    text = element_text(family = "Arial")
+  )
+
+# Display the map
+print(map_plot)
+
+```
+
+
+
+# Clustering based on autoregressive statistics
+
+```{r}
+# Set the max AR order to which estimate the statistics
+n <- nrow(d_wide[[1]])
+ar_order <- min(round(n/3), n - 1, 10 * log10(n))
+```
+
+Estimate autoregressive (AR) coefficients $\phi$ of up to order $p =$ `r ar_order`:
+$$
+X_t = \phi_1 X_{t-1} + \phi_2 X_{t-2} + \dots + \phi_p X_{t-p} + Z_t,
+$$
+where $X_t$ is the time series recorded for years $t$, and $Z_t$ is a white noise time series representing residual variations.
+
+```{r}
+ARs <- lapply(d_wide_impute, function(X)
+  apply(X[,-1], 2, function(x) 
+    stats::arima(x - mean(x, na.rm = TRUE), order = c(ar_order, 0, 0), method = "ML", include.mean = FALSE)$coef)
+)
+```
+
+Apply and compare clustering methods for varying number of clusters $k$.
+Since the true data grouping is unknown, we use the cluster validation indices, average silhouette width and modified Dunn index, to compare different options.
+Both of these indices evaluate compactness and separation of clusters (higher values indicate better-defined clusters).
+
+
+```{r, results='asis'}
+CLresults <- maps <- list()
+for (i in 1:length(vars2study)) {
+  v <- vars2study[i]
+  print(v)
+  
+  dm <- stats::dist(ARs[[v]] %>% t())
+  
+  clucomp_results <- clucomp(dm, k = 2:5,  
+                             methods = c('complete', 'PAM', 'single', 'ward.D2'), 
+                             criteria = c('avg.silwidth', 'ch', 'wb.ratio'))
+  opt_k <- clucomp_results$opt_k
+  opt_method <- clucomp_results$opt_method
+  
+  # Store the resulting clusters
+  if (opt_method == 'PAM') {
+    opt_cl <- cluster::pam(dm, k = opt_k, diss = TRUE)
+    opt_cl_labels <- opt_cl$clustering
+  } else {
+    opt_cl <- hclust(dm, method = opt_method)
+    opt_cl_labels <- cutree(opt_cl, k = opt_k)
+  }
+  clusters <- lapply(1:opt_k, function(x) names(opt_cl_labels[opt_cl_labels == x]))
+  
+  
+  ## DBSCAN
+  
+  # identify optimal 'eps' given minPts = 2
+  (sort(kNNdist(dm, k = 1)))
+  kNNdistplot(dm, minPts = 2)
+  # results from visual inspection:
+  epsvec <- c(0.2, 0.4, 0.3, 0.5, 0.4)
+  
+  # store and print resulting clusters
+  dbs <- dbscan(dm, eps = epsvec[i], minPts = 2)$cluster
+  clusters_dbs <- lapply(1:max(dbs), function(x) names(dm)[dbs == x])
+  clusters_dbs_noise <- names(dm)[dbs == 0] # noise
+  
+  
+  ## Final Results
+  CLresults[[i]] <- list(opt_k = opt_k,
+                         opt_method = opt_method,
+                         opt_cl_labels = tibble(DBOnme = names(opt_cl_labels),
+                                                Cluster = as.integer(opt_cl_labels)),
+                         clusters = clusters,
+                         clusters_dbs = clusters_dbs,
+                         clusters_dbs_noise = clusters_dbs_noise,
+                         opt_cl_labels_dbs = tibble(DBOnme = stations2keep,
+                                                    Cluster = dbs))
+
+  
+  # Plot map
+  COORDs <- left_join(COORD, CLresults[[i]]$opt_cl_labels, by = "DBOnme")
+  
+  # Create a color palette based on Cluster 
+  n_clusters <- length(unique(COORDs$Cluster)) 
+  palette_colors <- brewer.pal(min(n_clusters, 9), "Set1") # Use 'Set1' palette with up to 9 colors 
+  pal <- colorFactor(palette = palette_colors, domain = COORDs$Cluster)
+  
+  p <- leaflet(COORDs) %>%
+    addTiles() %>%
+    setView(lng = COORD$Longitude[1], lat = COORD$Latitude[1], zoom = 4) %>%
+    addCircleMarkers(~Longitude, ~Latitude, 
+                     popup = ~paste0(DBOnme, "<br>Cluster: ", Cluster), 
+                     radius = 6,
+                     stroke = FALSE, fillOpacity = 0.5,
+                     color = ~pal(Cluster)) %>% 
+    addControl(html = paste0("<strong>", v, " (", n_clusters, " clusters)", "</strong>"), 
+               position = "topright", className = "map-title")
+  
+  # print(p)
+  maps[[i]] <- p
+}
+htmltools::tagList(maps)
+names(CLresults) <- vars2study
+```
+
+
+
+Maps and plots for manuscript
+
+```{r}
+colors <- data.frame(color = c('#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#000000'),
+                     cluster = c(1, 2, 3, 4, 5, 0))
+axnames <- c('Temperature (ºC)', 'Salinity', 'Chlorophyll (mg/m^2)',
+             expression("Biomass (gC / m"^2*")"), '% Silt & Clay')
+
+CT <- c('opt_cl_labels', 'opt_cl_labels_dbs')
+
+for (i in 1:length(CLresults)) {
+  for (cltype in CT) {
+
+    coordstmp <- left_join(COORD, CLresults[[i]][[cltype]], by = "DBOnme") %>%
+      left_join(., colors, by = join_by(Cluster == cluster))
+
+    # map
+    mapx <- leaflet(coordstmp) %>%
+      addTiles() %>%
+      addCircleMarkers(radius = 6, stroke = TRUE, weight = 1, color = '#000', fillColor = coordstmp$color, fillOpacity = 0.9)
+    if (grepl('dbs', cltype)) {
+      mapshot(mapx, file = paste0('/Users/spencerblackwood/Documents/arcticts/output/AR/ARmap', vars2study[i], 'DBS.png'))
+    }
+    else {
+      mapshot(mapx, file = paste0('/Users/spencerblackwood/Documents/arcticts/output/AR/ARmap', vars2study[i], '.png'))
+    }
+
+    # cluster plots
+    for (j in unique(coordstmp$Cluster)) {
+      color_tmp <- coordstmp[coordstmp$Cluster == j, c('color')][[1]][[1]]
+      cluster_tmp <- coordstmp[coordstmp$Cluster == j, c('DBOnme')][[1]]
+      coordstmp_cl <- coordstmp %>% filter(Cluster == j)
+      data_tmp <- as.data.frame(d_wide_impute[[i]]) %>%
+        select(!Year)
+      minval <- min(data_tmp, na.rm = T)
+      maxval <- max(data_tmp, na.rm = T)
+      if (grepl('dbs', cltype)) {
+        png(file = paste0('/Users/spencerblackwood/Documents/arcticts/output/AR/ARplotD', i, '_', j, '.png'),
+            width = 960, height = 960, pointsize = 24)
+      }
+      else {
+        png(file = paste0('/Users/spencerblackwood/Documents/arcticts/output/AR/ARplot', i, '_', j, '.png'),
+            width = 960, height = 960, pointsize = 24)
+      }
+      par(mar = c(5, 5.7, 2, 1.7) + 0.1)
+      plot(2010:2019, unlist(data_tmp[,cluster_tmp[1]]), type = 'b', col = color_tmp, lwd = 4,
+           xlab = 'Year', ylab = '', ylim = c(minval, maxval), cex.axis = 1.5,
+           cex.lab = 1.5, las = 1)
+      title(ylab = axnames[i], line = 3.7, cex.lab = 1.5)
+      if (length(cluster_tmp) > 1) {
+        for (k in 2:length(cluster_tmp)) {
+          lines(2010:2019, unlist(data_tmp[,cluster_tmp[k]]), type = 'b', col = color_tmp, lwd = 4)
+        }
+      }
+      dev.off()
+    }
+  }
+}
+
+
+```
+
+
+
+```{r}
+# Create a bib database for R packages
+knitr::write_bib(c(.packages()
+                   ,'base'
+), 'refpackages.bib')
+```
+
+
+# Clustering based on dynamic time warping (DTW)
+
+```{r}
+# Window function for DTW warping window
+sakoeChibaWindowSB <- function (iw, jw, window.size, query.size, reference.size, ...) {
+  if (query.size - reference.size == 1) {       # if query and reference have same length
+    return(abs(jw + 1 - iw) <= window.size)
+  }
+  else if (query.size - reference.size == 0) {  # if query is 1 shorter than reference
+    return(abs(jw - iw) <= window.size)
+  }
+  else if (query.size - reference.size == -3) { # if query is 4 shorter than reference
+    return(abs(jw - 1 - iw) <= window.size)
+  }
+  else {
+    return(FALSE)
+  }
+}
+```
+
+
+Create dissimilarity matrices using DTW
+```{r}
+# Create a list of empty matrices
+n_stations <- length(stations2keep)
+dtw_dissim <- replicate(5, matrix(NA, nrow = n_stations, ncol = n_stations,
+                                  dimnames = list(stations2keep, stations2keep)),
+                        simplify = F)
+names(dtw_dissim) <- vars2study
+
+# Bulid the dissimilarity matrices
+for (k in 1:length(vars2study)) {
+  
+  # Build the upper triangle
+  for (i in 1:n_stations) {
+    for (j in i:n_stations) {
+      
+      # Assign the shorter series to be the query
+      tsq <- scale(na.omit(zoo(d_wide_impute[[k]][, i+1], vars2study)), scale = FALSE) # subtract the mean
+      tsr <- scale(na.omit(zoo(d_wide_impute[[k]][, j+1], vars2study)), scale = FALSE) # ""
+      if (length(tsq) > length(tsr)) {
+        tmp <- tsr
+        tsr <- tsq
+        tsq <- tmp
+      }
+      
+      # For two series of equal length, record average normalized dissimilarity
+      if (length(tsq) == length(tsr)) {
+        dtw_dissim[[k]][i, j] <- (dtw::dtw(tsq, tsr, step.pattern = asymmetric,
+                                           window.type = sakoeChibaWindowSB,
+                                           window.size = 2, keep.internals = TRUE,
+                                           open.end = TRUE,
+                                           open.begin = TRUE)$normalizedDistance +
+                                    dtw::dtw(tsr, tsq, step.pattern = asymmetric,
+                                             window.type = sakoeChibaWindowSB,
+                                             window.size = 2,keep.internals = TRUE,
+                                             open.end = TRUE,
+                                             open.begin = TRUE)$normalizedDistance) / 2
+      }
+      
+      # For two series of unequal length
+      else {
+        
+        # Case 1: Shorter series has length 9, missing observation at time point 1
+        if (length(tsr) - length(tsq) == 1) {
+          dtw_dissim[[k]][i, j] <- dtw::dtw(tsq, tsr, step.pattern = asymmetric,
+                                            window.type = sakoeChibaWindowSB,
+                                            window.size = 2, keep.internals = TRUE,
+                                            open.end = TRUE,
+                                            open.begin = TRUE)$normalizedDistance
+        }
+        
+        # Case 2: Shorter series has length 5, missing observations at time points 1-3, 9-10 
+        else {
+          tsr <- tsr[paste0("20", as.character(11:19))] # remove 2010 observation from reference
+          dtw_dissim[[k]][i, j] <- dtw::dtw(tsq, tsr, step.pattern = asymmetric,
+                                            window.type = sakoeChibaWindowSB,
+                                            window.size = 2, keep.internals = TRUE,
+                                            open.end = TRUE,
+                                            open.begin = TRUE)$normalizedDistance
+        }
+      }
+    }
+  }
+
+  # Fill in the lower triangle
+  dtw_dissim[[k]][lower.tri(dtw_dissim[[k]])] <- t(dtw_dissim[[k]])[lower.tri(dtw_dissim[[k]])]
+  dtw_dissim[[k]] <- as.dist(dtw_dissim[[k]])
+}
+```
+
+Apply and compare clustering methods for varying number of clusters $k$.
+Since the true data grouping is unknown, we use the cluster validation indices — average silhouette width, the C-H index, and the WB ratio — to compare different options.
+These indices evaluate compactness and separation of clusters. For average silhouette width and the C-H index, higher values indicate better-defined clusters, whereas lower values indicate the same for the WB ratio.
+We produce both a globular clustering as well as a density-based clustering for comparison. 
+
+```{r}
+results_dtw <- list()
+for (i in 1:length(vars2study)) {
+  
+  ## Agglomerative and Centroid-Based
+  
+  # obtain optimal 'k' and method
+  # ideally would use Davies-Bouldin Index instead of WB Ratio
+  clucomp_results <- clucomp(dtw_dissim[[i]], k = 2:5,
+                             methods = c('complete', 'PAM', 'single', 'ward.D2'), 
+                             criteria = c('avg.silwidth', 'ch', 'wb.ratio'))
+  opt_k <- clucomp_results$opt_k
+  opt_method <- clucomp_results$opt_method
+  
+  # store and print resulting clusters
+  if (opt_method == 'PAM') {
+    opt_cl <- cluster::pam(dtw_dissim[[i]], k = opt_k, diss = TRUE)
+    opt_cl_labels <- opt_cl$clustering
+  } else {
+    opt_cl <- hclust(dtw_dissim[[i]], method = opt_method)
+    opt_cl_labels <- cutree(opt_cl, k = opt_k)
+  }
+  clusters <- lapply(1:opt_k, function(x) names(opt_cl_labels[opt_cl_labels == x]))
+  
+  
+  ## DBSCAN
+  
+  # identify optimal 'eps' given minPts = 2
+  (sort(kNNdist(dtw_dissim[[i]], k = 1)))
+  kNNdistplot(dtw_dissim[[i]], minPts = 2)
+  # results from visual inspection:
+  epsvec <- c(0.3, 0.06, 1.6, 2.5, 2)
+  
+  
+  # # identify optimal 'eps' given minPts = 2 (pasted from Slava's function)
+  # # if I use this, also need to change 'eps = epsvec[i]' to 'eps = eps_knee' below
+  # knn_dist <- kNNdist(dtw_dissim[[i]], k = 1)
+  # knee <- kneedle(1:length(knn_dist), sort(knn_dist))
+  # eps_knee <- knee[2]
+  
+  
+  # store and print resulting clusters
+  dbs <- dbscan(dtw_dissim[[i]], eps = epsvec[i], minPts = 2)$cluster
+  clusters_dbs <- lapply(1:max(dbs), function(x) names(dtw_dissim[[i]])[dbs == x])
+  clusters_dbs_noise <- names(dtw_dissim[[i]])[dbs == 0] # noise
+  
+  
+  ## Final Results
+  clresults <- list(opt_k = opt_k,
+                    opt_method = opt_method,
+                    opt_cl_labels = tibble(DBOnme = names(opt_cl_labels),
+                                           Cluster = as.integer(opt_cl_labels)),
+                    clusters = clusters,
+                    clusters_dbs = clusters_dbs,
+                    clusters_dbs_noise = clusters_dbs_noise,
+                    opt_cl_labels_dbs = tibble(DBOnme = stations2keep,
+                                               Cluster = dbs))
+  results_dtw <- c(results_dtw, list(clresults))
+}
+names(results_dtw) <- vars2study
+```
+
+
+Produce maps and plots of the clustering results
+```{r}
+CT <- c('opt_cl_labels', 'opt_cl_labels_dbs')
+
+for (i in 1:length(results_dtw)) {
+  for (cltype in CT) {
+
+    coordstmp <- left_join(COORD, results_dtw[[i]][[cltype]], by = "DBOnme") %>%
+      left_join(., colors, by = join_by(Cluster == cluster))
+
+    # map
+    mapx <- leaflet(coordstmp) %>%
+      addTiles() %>%
+      addCircleMarkers(radius = 6, stroke = TRUE, weight = 1, color = '#000', fillColor = coordstmp$color, fillOpacity = 0.9)
+    if (grepl('dbs', cltype)) {
+      mapshot(mapx, file = paste0('/Users/spencerblackwood/Documents/arcticts/output/DTW/map', vars2study[i], 'DBS.png'))
+    }
+    else {
+      mapshot(mapx, file = paste0('/Users/spencerblackwood/Documents/arcticts/output/DTW/map', vars2study[i], '.png'))
+    }
+
+    # cluster plots
+    for (j in unique(coordstmp$Cluster)) {
+      color_tmp <- coordstmp[coordstmp$Cluster == j, c('color')][[1]][[1]]
+      cluster_tmp <- coordstmp[coordstmp$Cluster == j, c('DBOnme')][[1]]
+      coordstmp_cl <- coordstmp %>% filter(Cluster == j)
+      data_tmp <- as.data.frame(d_wide_impute[[i]]) %>%
+        select(!Year)
+      minval <- min(data_tmp, na.rm = T)
+      maxval <- max(data_tmp, na.rm = T)
+      if (grepl('dbs', cltype)) {
+        png(file = paste0('/Users/spencerblackwood/Documents/arcticts/output/DTW/plotD', i, '_', j, '.png'),
+            width = 960, height = 960, pointsize = 24)
+      }
+      else {
+        png(file = paste0('/Users/spencerblackwood/Documents/arcticts/output/DTW/plot', i, '_', j, '.png'),
+            width = 960, height = 960, pointsize = 24)
+      }
+      par(mar = c(5, 5.7, 2, 1.7) + 0.1)
+      plot(2010:2019, unlist(data_tmp[,cluster_tmp[1]]), type = 'b', col = color_tmp, lwd = 4,
+           xlab = 'Year', ylab = '', ylim = c(minval, maxval), cex.axis = 1.5,
+           cex.lab = 1.5, las = 1)
+      title(ylab = axnames[i], line = 3.7, cex.lab = 1.5)
+      if (length(cluster_tmp) > 1) {
+        for (k in 2:length(cluster_tmp)) {
+          lines(2010:2019, unlist(data_tmp[,cluster_tmp[k]]), type = 'b', col = color_tmp, lwd = 4)
+        }
+      }
+      dev.off()
+    }
+  }
+}
+```
+
+
+# Power Analysis
+
+Conduct power analysis for a mixed-effects model
+```{r}
+presults <- vector(mode = "list", length = 2)
+res <- list(CLresults, results_dtw)
+set.seed(6374)
+
+for (i in c(1, 2)) {
+  
+  for (varname in vars2study) {
+    
+    tempresults <- list()
+    
+    for (cltype in CT) {
+      
+      # merge cluster assignments onto imputed data set
+      d_temp <- d_wide_impute[[varname]] %>%
+        pivot_longer(cols = -Year, names_to = "Station", values_to = "Value") %>%
+        full_join(res[[i]][[varname]][[cltype]], by = join_by(Station == DBOnme)) %>%
+        filter(!is.na(Value))
+      d_temp$Cluster <- as.factor(d_temp$Cluster)
+      
+      # create new clusters for noise observations
+      if (0 %in% d_temp$Cluster) {
+        nclust <- length(unique(d_temp$Cluster))
+        d_temp_sub <- d_temp %>%
+          filter(Cluster == 0) %>%
+          group_by(Station, Cluster) %>%
+          summarise()
+        d_temp_sub$Cluster <-
+          as.factor(nclust:(nclust+nrow(d_temp_sub)-1))
+        d_temp <- d_temp %>%
+          filter(Cluster == 0) %>%
+          select(-Cluster) %>%
+          left_join(d_temp_sub) %>%
+          full_join(d_temp %>% filter(Cluster != 0))
+      }
+      
+      # Power analysis
+      model <- lmer(Value ~ Year + (1 | Cluster), data = d_temp)
+      p <- powerSim(model)
+      (p_summary <- summary(p))
+      tempresults <- c(tempresults, list(p_summary[3:5]))
+      
+    }
+    presults[[i]] <- c(presults[[i]], list(tempresults))
+  }
+}
+presults_ar <- presults[[1]]
+presults_dtw <- presults[[2]]
+names(presults_ar) <- vars2study
+names(presults_dtw) <- vars2study
+```
+
+Conduct power analysis for simple linear regression
+```{r}
+regresults <- list()
+
+for (varname in vars2study) {
+  tempresults <- list()
+  for (stat in stations2keep) {
+    
+    d_temp <- d_wide_impute[[varname]][, c('Year', stat)] %>%
+      filter(!is.na(get(stat)))
+    (p <- pwr.r.test(n = nrow(d_temp), r = cor(d_temp)[1,2]))
+    tempresults <- c(tempresults, list(p[c(1:2,4)]))
+    
+  }
+  names(tempresults) <- stations2keep
+  regresults <- c(regresults, list(tempresults))
+}
+names(regresults) <- vars2study
+```
+
+Create figures
+```{r}
+
+# Table of power analysis results
+powers <- lapply(regresults, function(v) unlist(lapply(v, function(x) c(x[['power']]))))
+table_p1 <- lapply(powers, function(x) c(quantile(x, probs = 0.025), mean(x), quantile(x, probs = 0.975))) %>%
+  do.call(rbind, .) %>%
+  as.data.frame()
+colnames(table_p1)[2] <- 'Mean'
+table_p2 <- lapply(presults_ar, function(x) rbind(unlist(x))) %>% 
+  do.call(rbind, .) %>%
+  as.data.frame()
+colnames(table_p2) <- c('ar_power_mean', 'ar_power_lower', 'ar_power_upper',
+                        'ar_power_mean_dbs', 'ar_power_lower_dbs', 'ar_power_upper_dbs')
+table_p3 <- lapply(presults_dtw, function(x) rbind(unlist(x))) %>% 
+  do.call(rbind, .) %>%
+  as.data.frame()
+colnames(table_p3) <- c('dtw_power_mean', 'dtw_power_lower', 'dtw_power_upper',
+                        'dtw_power_mean_dbs', 'dtw_power_lower_dbs', 'dtw_power_upper_dbs')
+table_p <- round(cbind(table_p1, table_p2, table_p3), 2)
+
+# Boxplot (powers from simple linear regression)
+data_powerplot <- data.frame(powers[1:5])
+par(mar = c(3, 4.5, 1.5, 1.5))
+Boxplot(data_powerplot, data = data_powerplot, labels = row.names(data_powerplot),
+        outcex = 1, outpch = 8, outcol = 'red', col = '#B2D2DD', ylab = 'Power', las = 1)
+
+
+# Maps of simple linear regression power results for each variable
+data_powerplot <- data_powerplot %>%
+  mutate(DBOnme = rownames(.)) %>%
+  left_join(COORD, ., by = 'DBOnme')
+for (i in vars2study) {
+  mapx <- leaflet(data_powerplot) %>%
+      addTiles() %>%
+      addCircleMarkers(radius = ~get(i)*12, stroke = TRUE, weight = 1, color = '#000', fillColor = '#f4a582', fillOpacity = 0.9)
+  mapshot(mapx, file = paste0('/Users/spencerblackwood/Documents/arcticts/output/power/powermap', i, '.png'))
+}
+
+
+
+
+
+# # Extra boxplot code
+# # also consider using gghighlight and ggrepel for labelling outliers
+# data_plot <- data_plot %>%
+#   mutate(Station = rownames(data_plot)) %>%
+#   pivot_longer(cols = all_of(vars2study), names_to = "Var", values_to = "Values")
+# data_plot$Var <- as.factor(data_plot$Var)
+# 
+# ggplot(data_plot, aes(x = Var, y = Values, label = Station)) + 
+#   geom_boxplot(outlier.colour="red", outlier.shape=8,
+#                 outlier.size=4) + 
+#   geom_text_repel() + labs(title = "geom_text_repel()")
+```
+
+
+
+# References {.unnumbered}
+
+::: {#refs}
+:::

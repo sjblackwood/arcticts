@@ -4,5 +4,6 @@
 .Ruserdata
 .DS_Store
 data*/
-refpackages.bib
 /.quarto/
+
+**/*.quarto_ipynb

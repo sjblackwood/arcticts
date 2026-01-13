@@ -1,6 +1,6 @@
 ---
-title: Arctic time series
-author: Vyacheslav Lyubchich, et al.
+title: R code and output for Arctic time series analysis
+author: Spencer Blackwood and Vyacheslav Lyubchich
 date: today
 date-format: iso
 format:
@@ -14,9 +14,9 @@ format:
     fig-height: 5
 bibliography:
     - refpackages.bib
+csl: springer-basicVL.csl
 knitr:
     opts_chunk:
-        
         echo: true
         message: false
         warning: false
@@ -24,6 +24,8 @@ knitr:
 editor_options: 
   chunk_output_type: console
 ---
+
+# Setup
 
 ```{r}
 rm(list = ls())
@@ -42,6 +44,7 @@ library(leaflet)
 library(RColorBrewer)
 library(htmltools)
 library(mapview)
+library(webshot)
 library(car)
 library(sf)
 library(marmap)
@@ -62,6 +65,33 @@ source("code/fun_clucomp.R")
 source("code/fun_kneedle.R")
 ```
 
+This report uses R [@R-base] and R packages 
+`dplyr` [@R-dplyr],
+`tidyr` [@R-tidyr],
+`readxl` [@R-readxl],
+`ggplot2` [@R-ggplot2],
+`patchwork` [@R-patchwork],
+`plotly` [@R-plotly],
+`leaflet` [@R-leaflet],
+`RColorBrewer` [@R-RColorBrewer],
+`htmltools` [@R-htmltools],
+`mapview` [@R-mapview],
+`webshot` [@R-webshot],
+`car` [@R-car],
+`sf` [@R-sf],
+`marmap` [@R-marmap],
+`rnaturalearth` [@R-rnaturalearth],
+`imputeTS` [@R-imputeTS],
+`fpc` [@R-fpc],
+`cluster` [@R-cluster],
+`zoo` [@R-zoo],
+`dtw` [@R-dtw],
+`dbscan` [@R-dbscan],
+`nlme` [@R-nlme],
+`simr` [@R-simr], and
+`pwr` [@R-pwr].
+
+
 ```{r}
 # Significance level
 alpha <- 0.05
@@ -70,10 +100,10 @@ alpha <- 0.05
 n_thr <- 5
 ```
 
-
 # Data
 
 Import benthic data.
+
 ```{r}
 D0 <- read_xlsx("dataraw/BenthicTimeSeries_UniqueID_0-5nm_DBO_063023_v3.xlsx", 
                 sheet = 3) %>%
@@ -95,6 +125,7 @@ if (!tmp) print("Check station labels!")
 ```
 
 Define summer as the months June--August.
+
 ```{r}
 summer <- 6:8
 ```
@@ -135,6 +166,7 @@ ggplotly(p)
 ```
 
 Keep only data for summers 2010--2019, remove data from DBO4 and DBO5.
+
 ```{r}
 D <- D0 %>%
   dplyr::filter(Month %in% summer) %>% 
@@ -143,6 +175,7 @@ D <- D0 %>%
 ```
 
 Aggregate the data by calculating summer averages for selected environmental variables.
+
 ```{r}
 d <- D %>%
   group_by(DBOnme, Year) %>%
@@ -181,6 +214,7 @@ ggplotly(p)
 ```
 
 Keep stations with at least `r n_thr` observations.
+
 ```{r}
 # Select which stations to keep
 stations2keep <- N_station %>% 
@@ -193,6 +227,7 @@ d <- d %>%
 ```
 
 Reformat the data in a "wide" format (time series as columns).
+
 ```{r}
 # Reformat the data to wide format by Year for each DBOnme
 d_wide <- lapply(vars2study, function(x)
@@ -235,6 +270,7 @@ print(combined_plot)
 ```
 
 Impute missing values using state-space models for univariate time series based on a decomposition of the series -- see the function `StructTS()` [@R-base].
+
 ```{r}
 # Impute pattern one (missing only time point #2, i.e. 2011)
 d_wide_impute <- lapply(d_wide, function(X)
@@ -257,6 +293,7 @@ d_wide_impute <- lapply(d_wide, function(X)
 ```
 
 Plot the heatmaps again to assess the imputations (@fig-heatimpute).
+
 ```{r}
 #| label: fig-heatimpute
 #| fig-cap: "Heatmaps showing the values of aggregate samples (including imputed values) per year and station."
@@ -284,6 +321,7 @@ print(combined_plot)
 ```
 
 Extract coordinates of the selected stations.
+
 ```{r}
 COORD <- D %>% 
   dplyr::filter(DBOnme %in% stations2keep) %>% 
@@ -369,20 +407,26 @@ map_plot <- ggplot() +
        x = "Longitude",
        y = "Latitude",
        fill = "Depth (m)") +
-  theme_minimal() +
+  theme_light() +
   theme(
     plot.title = element_text(hjust = 0.5, face = "bold"),
     plot.subtitle = element_text(hjust = 0.5),
     legend.position = "right",
     text = element_text(family = "Arial")
-  )
+  ) +
+  # add minor ticks at each 1 degree
+  scale_x_continuous(breaks = seq(min_lon, max_lon, by = 2)) +
+  scale_y_continuous(breaks = seq(min_lat, max_lat, by = 1))
+                     
 
 # Display the map
 print(map_plot)
 
+# Save the map
+png(file = "output/map0.png", width = 7, height = 6, res = 600, units = "in")
+print(map_plot)
+dev.off()
 ```
-
-
 
 # Clustering based on autoregressive statistics
 
@@ -392,11 +436,9 @@ n <- nrow(d_wide[[1]])
 ar_order <- min(round(n/3), n - 1, 10 * log10(n))
 ```
 
-Estimate autoregressive (AR) coefficients $\phi$ of up to order $p =$ `r ar_order`:
-$$
+Estimate autoregressive (AR) coefficients $\phi$ of up to order $p =$ `r ar_order`: $$
 X_t = \phi_1 X_{t-1} + \phi_2 X_{t-2} + \dots + \phi_p X_{t-p} + Z_t,
-$$
-where $X_t$ is the time series recorded for years $t$, and $Z_t$ is a white noise time series representing residual variations.
+$$ where $X_t$ is the time series recorded for years $t$, and $Z_t$ is a white noise time series representing residual variations.
 
 ```{r}
 ARs <- lapply(d_wide_impute, function(X)
@@ -405,12 +447,11 @@ ARs <- lapply(d_wide_impute, function(X)
 )
 ```
 
-Apply and compare clustering methods for varying number of clusters $k$.
-Since the true data grouping is unknown, we use the cluster validation indices, average silhouette width and modified Dunn index, to compare different options.
-Both of these indices evaluate compactness and separation of clusters (higher values indicate better-defined clusters).
-
+Apply and compare clustering methods for varying number of clusters $k$. Since the true data grouping is unknown, we use the cluster validation indices, average silhouette width and modified Dunn index, to compare different options. Both of these indices evaluate compactness and separation of clusters (higher values indicate better-defined clusters).
 
 ```{r, results='asis'}
+#| cache: true
+
 CLresults <- maps <- list()
 for (i in 1:length(vars2study)) {
   v <- vars2study[i]
@@ -487,8 +528,6 @@ htmltools::tagList(maps)
 names(CLresults) <- vars2study
 ```
 
-
-
 Maps and plots for manuscript
 
 ```{r}
@@ -510,10 +549,10 @@ for (i in 1:length(CLresults)) {
       addTiles() %>%
       addCircleMarkers(radius = 6, stroke = TRUE, weight = 1, color = '#000', fillColor = coordstmp$color, fillOpacity = 0.9)
     if (grepl('dbs', cltype)) {
-      mapshot(mapx, file = paste0('/Users/spencerblackwood/Documents/arcticts/output/AR/ARmap', vars2study[i], 'DBS.png'))
+      mapshot(mapx, file = paste0('./output/AR/ARmap', vars2study[i], 'DBS.png'))
     }
     else {
-      mapshot(mapx, file = paste0('/Users/spencerblackwood/Documents/arcticts/output/AR/ARmap', vars2study[i], '.png'))
+      mapshot(mapx, file = paste0('./output/AR/ARmap', vars2study[i], '.png'))
     }
 
     # cluster plots
@@ -526,11 +565,11 @@ for (i in 1:length(CLresults)) {
       minval <- min(data_tmp, na.rm = T)
       maxval <- max(data_tmp, na.rm = T)
       if (grepl('dbs', cltype)) {
-        png(file = paste0('/Users/spencerblackwood/Documents/arcticts/output/AR/ARplotD', i, '_', j, '.png'),
+        png(file = paste0('./output/AR/ARplotD', i, '_', j, '.png'),
             width = 960, height = 960, pointsize = 24)
       }
       else {
-        png(file = paste0('/Users/spencerblackwood/Documents/arcticts/output/AR/ARplot', i, '_', j, '.png'),
+        png(file = paste0('./output/AR/ARplot', i, '_', j, '.png'),
             width = 960, height = 960, pointsize = 24)
       }
       par(mar = c(5, 5.7, 2, 1.7) + 0.1)
@@ -547,17 +586,6 @@ for (i in 1:length(CLresults)) {
     }
   }
 }
-
-
-```
-
-
-
-```{r}
-# Create a bib database for R packages
-knitr::write_bib(c(.packages()
-                   ,'base'
-), 'refpackages.bib')
 ```
 
 
@@ -581,9 +609,11 @@ sakoeChibaWindowSB <- function (iw, jw, window.size, query.size, reference.size,
 }
 ```
 
-
 Create dissimilarity matrices using DTW
+
 ```{r}
+#| cache: true
+
 # Create a list of empty matrices
 n_stations <- length(stations2keep)
 dtw_dissim <- replicate(5, matrix(NA, nrow = n_stations, ncol = n_stations,
@@ -591,7 +621,7 @@ dtw_dissim <- replicate(5, matrix(NA, nrow = n_stations, ncol = n_stations,
                         simplify = F)
 names(dtw_dissim) <- vars2study
 
-# Bulid the dissimilarity matrices
+# Build the dissimilarity matrices
 for (k in 1:length(vars2study)) {
   
   # Build the upper triangle
@@ -652,10 +682,7 @@ for (k in 1:length(vars2study)) {
 }
 ```
 
-Apply and compare clustering methods for varying number of clusters $k$.
-Since the true data grouping is unknown, we use the cluster validation indices — average silhouette width, the C-H index, and the WB ratio — to compare different options.
-These indices evaluate compactness and separation of clusters. For average silhouette width and the C-H index, higher values indicate better-defined clusters, whereas lower values indicate the same for the WB ratio.
-We produce both a globular clustering as well as a density-based clustering for comparison. 
+Apply and compare clustering methods for varying number of clusters $k$. Since the true data grouping is unknown, we use the cluster validation indices — average silhouette width, the C-H index, and the WB ratio — to compare different options. These indices evaluate compactness and separation of clusters. For average silhouette width and the C-H index, higher values indicate better-defined clusters, whereas lower values indicate the same for the WB ratio. We produce both a globular clustering as well as a density-based clustering for comparison.
 
 ```{r}
 results_dtw <- list()
@@ -690,14 +717,6 @@ for (i in 1:length(vars2study)) {
   # results from visual inspection:
   epsvec <- c(0.3, 0.06, 1.6, 2.5, 2)
   
-  
-  # # identify optimal 'eps' given minPts = 2 (pasted from Slava's function)
-  # # if I use this, also need to change 'eps = epsvec[i]' to 'eps = eps_knee' below
-  # knn_dist <- kNNdist(dtw_dissim[[i]], k = 1)
-  # knee <- kneedle(1:length(knn_dist), sort(knn_dist))
-  # eps_knee <- knee[2]
-  
-  
   # store and print resulting clusters
   dbs <- dbscan(dtw_dissim[[i]], eps = epsvec[i], minPts = 2)$cluster
   clusters_dbs <- lapply(1:max(dbs), function(x) names(dtw_dissim[[i]])[dbs == x])
@@ -719,8 +738,8 @@ for (i in 1:length(vars2study)) {
 names(results_dtw) <- vars2study
 ```
 
-
 Produce maps and plots of the clustering results
+
 ```{r}
 CT <- c('opt_cl_labels', 'opt_cl_labels_dbs')
 
@@ -735,10 +754,10 @@ for (i in 1:length(results_dtw)) {
       addTiles() %>%
       addCircleMarkers(radius = 6, stroke = TRUE, weight = 1, color = '#000', fillColor = coordstmp$color, fillOpacity = 0.9)
     if (grepl('dbs', cltype)) {
-      mapshot(mapx, file = paste0('/Users/spencerblackwood/Documents/arcticts/output/DTW/map', vars2study[i], 'DBS.png'))
+      mapshot(mapx, file = paste0('./output/DTW/map', vars2study[i], 'DBS.png'))
     }
     else {
-      mapshot(mapx, file = paste0('/Users/spencerblackwood/Documents/arcticts/output/DTW/map', vars2study[i], '.png'))
+      mapshot(mapx, file = paste0('./output/DTW/map', vars2study[i], '.png'))
     }
 
     # cluster plots
@@ -751,11 +770,11 @@ for (i in 1:length(results_dtw)) {
       minval <- min(data_tmp, na.rm = T)
       maxval <- max(data_tmp, na.rm = T)
       if (grepl('dbs', cltype)) {
-        png(file = paste0('/Users/spencerblackwood/Documents/arcticts/output/DTW/plotD', i, '_', j, '.png'),
+        png(file = paste0('./output/DTW/plotD', i, '_', j, '.png'),
             width = 960, height = 960, pointsize = 24)
       }
       else {
-        png(file = paste0('/Users/spencerblackwood/Documents/arcticts/output/DTW/plot', i, '_', j, '.png'),
+        png(file = paste0('./output/DTW/plot', i, '_', j, '.png'),
             width = 960, height = 960, pointsize = 24)
       }
       par(mar = c(5, 5.7, 2, 1.7) + 0.1)
@@ -774,10 +793,10 @@ for (i in 1:length(results_dtw)) {
 }
 ```
 
-
 # Power Analysis
 
 Conduct power analysis for a mixed-effects model
+
 ```{r}
 presults <- vector(mode = "list", length = 2)
 res <- list(CLresults, results_dtw)
@@ -831,6 +850,7 @@ names(presults_dtw) <- vars2study
 ```
 
 Conduct power analysis for simple linear regression
+
 ```{r}
 regresults <- list()
 
@@ -851,6 +871,7 @@ names(regresults) <- vars2study
 ```
 
 Create figures
+
 ```{r}
 
 # Table of power analysis results
@@ -886,11 +907,8 @@ for (i in vars2study) {
   mapx <- leaflet(data_powerplot) %>%
       addTiles() %>%
       addCircleMarkers(radius = ~get(i)*12, stroke = TRUE, weight = 1, color = '#000', fillColor = '#f4a582', fillOpacity = 0.9)
-  mapshot(mapx, file = paste0('/Users/spencerblackwood/Documents/arcticts/output/power/powermap', i, '.png'))
+  mapshot(mapx, file = paste0('./output/power/powermap', i, '.png'))
 }
-
-
-
 
 
 # # Extra boxplot code
@@ -907,6 +925,12 @@ for (i in vars2study) {
 ```
 
 
+```{r}
+# Create a bib database for R packages
+knitr::write_bib(c(.packages()
+                   ,'base'
+), 'refpackages.bib')
+```
 
 # References {.unnumbered}
 

@@ -351,14 +351,14 @@ bathy_df <- as.xyz(bathy_data)
 
 # Create data frames for geographic labels
 geo_labels <- data.frame(
-  label = c("Bering Sea", "Alaska (U.S.A.)", "Russia", "Chukchi Sea"),
-  lon = c(-169, -163, -176, -173),
-  lat = c(62, 65.5, 66, 68.5)
+  label = c("Bering Sea", "Alaska (U.S.A.)", "Russia", "Chukchi Sea", "Chirikov Basin", "Bering Strait", "St. Lawrence Island"),
+  lon = c(-169, -163, -176, -173, -169, -168.5, -170.25),
+  lat = c(62, 65.5, 66, 68.5, 64.25, 66, 63.5)
 )
 geo_labels_dbo <- data.frame(
   label = c("DBO1", "DBO2", "DBO3"),
-  lon = c(-176, -168, -167),
-  lat = c(63, 64.25, 67.5)
+  lon = c(-176, -167.5, -167),
+  lat = c(63, 64.75, 67.5)
 )
 
 # Get coastline data for plotting land
@@ -572,11 +572,11 @@ for (i in 1:length(CLresults)) {
         png(file = paste0('./output/AR/ARplot', i, '_', j, '.png'),
             width = 960, height = 960, pointsize = 24)
       }
-      par(mar = c(5, 5.7, 2, 1.7) + 0.1)
+      par(mar = c(5.5, 6.2, 2, 1.7) + 0.1)
       plot(2010:2019, unlist(data_tmp[,cluster_tmp[1]]), type = 'b', col = color_tmp, lwd = 4,
-           xlab = 'Year', ylab = '', ylim = c(minval, maxval), cex.axis = 1.5,
-           cex.lab = 1.5, las = 1)
-      title(ylab = axnames[i], line = 3.7, cex.lab = 1.5)
+           xlab = 'Year', ylab = '', ylim = c(minval, maxval), cex.axis = 2,
+           cex.lab = 2, las = 1)
+      title(ylab = axnames[i], line = 3.7, cex.lab = 2)
       if (length(cluster_tmp) > 1) {
         for (k in 2:length(cluster_tmp)) {
           lines(2010:2019, unlist(data_tmp[,cluster_tmp[k]]), type = 'b', col = color_tmp, lwd = 4)
@@ -777,11 +777,11 @@ for (i in 1:length(results_dtw)) {
         png(file = paste0('./output/DTW/plot', i, '_', j, '.png'),
             width = 960, height = 960, pointsize = 24)
       }
-      par(mar = c(5, 5.7, 2, 1.7) + 0.1)
+      par(mar = c(5.5, 6.2, 2, 1.7) + 0.1)
       plot(2010:2019, unlist(data_tmp[,cluster_tmp[1]]), type = 'b', col = color_tmp, lwd = 4,
-           xlab = 'Year', ylab = '', ylim = c(minval, maxval), cex.axis = 1.5,
-           cex.lab = 1.5, las = 1)
-      title(ylab = axnames[i], line = 3.7, cex.lab = 1.5)
+           xlab = 'Year', ylab = '', ylim = c(minval, maxval), cex.axis = 2,
+           cex.lab = 2, las = 1)
+      title(ylab = axnames[i], line = 3.7, cex.lab = 2)
       if (length(cluster_tmp) > 1) {
         for (k in 2:length(cluster_tmp)) {
           lines(2010:2019, unlist(data_tmp[,cluster_tmp[k]]), type = 'b', col = color_tmp, lwd = 4)
@@ -906,7 +906,7 @@ data_powerplot <- data_powerplot %>%
 for (i in vars2study) {
   mapx <- leaflet(data_powerplot) %>%
       addTiles() %>%
-      addCircleMarkers(radius = ~get(i)*12, stroke = TRUE, weight = 1, color = '#000', fillColor = '#f4a582', fillOpacity = 0.9)
+      addCircleMarkers(radius = ~get(i)*16, stroke = TRUE, weight = 1, color = '#000', fillColor = '#de5012', fillOpacity = 0.9)
   mapshot(mapx, file = paste0('./output/power/powermap', i, '.png'))
 }
 
